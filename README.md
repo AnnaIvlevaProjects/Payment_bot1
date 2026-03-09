@@ -52,8 +52,19 @@ cp .env.example .env
 - `COURSE_CHAT_LINK` — ссылка-приглашение в чат;
 - `DB_PATH` — путь до SQLite;
 - `CHECK_INTERVAL_HOURS` — интервал фоновой проверки;
+- `DB_EXPORT_INTERVAL_HOURS` — как часто проверять, не пора ли делать суточную выгрузку БД;
+- `DB_EXPORT_PATH` — папка, куда сохраняются CSV-выгрузки пользователей;
+- `YANDEX_DISK_TOKEN` — OAuth-токен Яндекс.Диска для автоматической загрузки выгрузок;
+- `YANDEX_DISK_EXPORT_PATH` — путь на Яндекс.Диске для выгрузок (по умолчанию `app:/payment_bot_exports`);
 - `COURSE_START_DATE` — дата старта обучения в формате `YYYY-MM-DD`;
 - `MESSAGES_FILE` — путь до файла с текстами (по умолчанию `messages.json`).
+
+## Ежедневная выгрузка БД
+- Бот раз в сутки формирует CSV-таблицу `users_export_YYYY-MM-DD.csv` со всеми полями пользователей.
+- Файл сохраняется в папку `DB_EXPORT_PATH` (по умолчанию `exports`).
+- После формирования бот отправляет CSV в `ADMIN_CHAT_ID`.
+- При наличии `YANDEX_DISK_TOKEN` бот автоматически загружает тот же CSV на Яндекс.Диск в `YANDEX_DISK_EXPORT_PATH` (вручную переносить в онлайн-хранилище не нужно).
+- Частота фоновой проверки на новый день задается `DB_EXPORT_INTERVAL_HOURS` (по умолчанию `1`).
 
 ## Запуск
 ```bash
