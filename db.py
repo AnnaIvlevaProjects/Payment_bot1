@@ -192,6 +192,33 @@ class Database:
             )
         return users
 
+    async def export_users_table(self) -> tuple[list[str], list[list[str]]]:
+        columns = [
+            "user_id",
+            "user_name",
+            "user_FN",
+            "user_LN",
+            "user_email",
+            "source",
+            *PAYMENT_COLUMNS,
+            "course_start_date",
+            "selected_month",
+            "removed_from_chat",
+            "last_reminder_month",
+            "last_removal_month",
+            "created_at",
+            "updated_at",
+        ]
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(f"SELECT {', '.join(columns)} FROM users ORDER BY user_id")
+            rows = await cursor.fetchall()
+
+        export_rows: list[list[str]] = []
+        for row in rows:
+            export_rows.append(["" if row[column] is None else str(row[column]) for column in columns])
+        return columns, export_rows
+
     async def set_removed_flag(self, user_id: int, removed: bool) -> None:
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute(

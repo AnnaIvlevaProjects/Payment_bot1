@@ -6,8 +6,13 @@ import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from xml.sax.saxutils import escape
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -16,7 +21,7 @@ from aiogram.filters import CommandStart
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 from dotenv import load_dotenv
 
 from db import Database
@@ -40,6 +45,10 @@ class Settings:
     course_chat_link: str
     db_path: str
     check_interval_hours: int
+    db_export_interval_hours: int
+    db_export_path: str
+    yandex_disk_token: str | None
+    yandex_disk_export_path: str
     course_start_date: date
     messages_file: str
 
@@ -72,6 +81,10 @@ def load_settings() -> Settings:
         course_chat_link=os.environ["COURSE_CHAT_LINK"],
         db_path=os.getenv("DB_PATH", "bot.db"),
         check_interval_hours=int(os.getenv("CHECK_INTERVAL_HOURS", "24")),
+        db_export_interval_hours=int(os.getenv("DB_EXPORT_INTERVAL_HOURS", "1")),
+        db_export_path=os.getenv("DB_EXPORT_PATH", "exports"),
+        yandex_disk_token=os.getenv("YANDEX_DISK_TOKEN"),
+        yandex_disk_export_path=os.getenv("YANDEX_DISK_EXPORT_PATH", "app:/payment_bot_exports"),
         course_start_date=date.fromisoformat(os.getenv("COURSE_START_DATE", "2026-04-04")),
         messages_file=os.getenv("MESSAGES_FILE", "messages.json"),
     )
@@ -298,6 +311,137 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
         await asyncio.sleep(settings.check_interval_hours * 3600)
 
 
+def _column_letter(column_index: int) -> str:
+    result = ""
+    index = column_index
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _build_sheet_xml(columns: list[str], rows: list[list[str]]) -> str:
+    all_rows = [columns, *rows]
+    xml_rows: list[str] = []
+    for row_index, row_values in enumerate(all_rows, start=1):
+        cells: list[str] = []
+        for column_index, cell_value in enumerate(row_values, start=1):
+            cell_ref = f"{_column_letter(column_index)}{row_index}"
+            escaped_value = escape(cell_value)
+            cells.append(f'<c r="{cell_ref}" t="inlineStr"><is><t>{escaped_value}</t></is></c>')
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>'
+        f'{"".join(xml_rows)}'
+        '</sheetData>'
+        '</worksheet>'
+    )
+
+
+def write_xlsx_export(path: Path, columns: list[str], rows: list[list[str]]) -> None:
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="users" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+    worksheet = _build_sheet_xml(columns, rows)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
+def _build_daily_export_path(base_path: str, for_date: date) -> Path:
+    export_dir = Path(base_path)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    return export_dir / f"users_export_{for_date.isoformat()}.xlsx"
+
+
+def _upload_file_to_yandex_disk(local_file: Path, token: str, remote_path: str) -> None:
+    encoded_path = urllib.parse.quote(remote_path, safe="/:")
+    url = f"https://cloud-api.yandex.net/v1/disk/resources/upload?path={encoded_path}&overwrite=true"
+    request = urllib.request.Request(url, method="GET", headers={"Authorization": f"OAuth {token}"})
+
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        payload = json.loads(response.read().decode("utf-8"))
+
+    upload_href = payload["href"]
+    with local_file.open("rb") as handle:
+        upload_request = urllib.request.Request(upload_href, data=handle.read(), method="PUT")
+        with urllib.request.urlopen(upload_request, timeout=60):  # noqa: S310
+            pass
+
+
+async def upload_file_to_yandex_disk(local_file: Path, token: str, remote_path: str) -> None:
+    await asyncio.to_thread(_upload_file_to_yandex_disk, local_file, token, remote_path)
+
+
+async def daily_db_export_worker(bot: Bot, db: Database, settings: Settings) -> None:
+    last_exported_date: date | None = None
+    while True:
+        today = date.today()
+        if last_exported_date != today:
+            export_file = _build_daily_export_path(settings.db_export_path, today)
+            try:
+                columns, rows = await db.export_users_table()
+                write_xlsx_export(export_file, columns, rows)
+
+                await bot.send_document(
+                    settings.admin_chat_id,
+                    document=FSInputFile(export_file),
+                    caption=f"Ежедневная выгрузка БД за {today.strftime('%d.%m.%Y')} ({datetime.now().strftime('%H:%M')})",
+                )
+
+                if settings.yandex_disk_token:
+                    remote_path = f"{settings.yandex_disk_export_path.rstrip('/')}/{export_file.name}"
+                    await upload_file_to_yandex_disk(export_file, settings.yandex_disk_token, remote_path)
+                else:
+                    logging.info("YANDEX_DISK_TOKEN is not set: skipping Yandex Disk upload")
+
+                last_exported_date = today
+            except (urllib.error.URLError, KeyError, ValueError) as exc:
+                logging.warning("Could not upload export to Yandex Disk for %s: %s", today, exc)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not export database for %s: %s", today, exc)
+
+        await asyncio.sleep(settings.db_export_interval_hours * 3600)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -314,10 +458,12 @@ async def main() -> None:
     dp.include_router(router)
 
     guard_task = asyncio.create_task(payment_guard_worker(bot, db, settings, messages))
+    export_task = asyncio.create_task(daily_db_export_worker(bot, db, settings))
     try:
         await dp.start_polling(bot)
     finally:
         guard_task.cancel()
+        export_task.cancel()
 
 
 if __name__ == "__main__":
