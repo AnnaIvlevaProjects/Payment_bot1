@@ -9,6 +9,8 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from xml.sax.saxutils import escape
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 from dotenv import load_dotenv
-from openpyxl import Workbook
 
 from db import Database
 from keyboards import back_to_main_menu, email_offer_kb, main_menu, month_selector
@@ -310,6 +311,81 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
         await asyncio.sleep(settings.check_interval_hours * 3600)
 
 
+def _column_letter(column_index: int) -> str:
+    result = ""
+    index = column_index
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _build_sheet_xml(columns: list[str], rows: list[list[str]]) -> str:
+    all_rows = [columns, *rows]
+    xml_rows: list[str] = []
+    for row_index, row_values in enumerate(all_rows, start=1):
+        cells: list[str] = []
+        for column_index, cell_value in enumerate(row_values, start=1):
+            cell_ref = f"{_column_letter(column_index)}{row_index}"
+            escaped_value = escape(cell_value)
+            cells.append(f'<c r="{cell_ref}" t="inlineStr"><is><t>{escaped_value}</t></is></c>')
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>'
+        f'{"".join(xml_rows)}'
+        '</sheetData>'
+        '</worksheet>'
+    )
+
+
+def write_xlsx_export(path: Path, columns: list[str], rows: list[list[str]]) -> None:
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="users" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+    worksheet = _build_sheet_xml(columns, rows)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
 def _build_daily_export_path(base_path: str, for_date: date) -> Path:
     export_dir = Path(base_path)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -343,13 +419,7 @@ async def daily_db_export_worker(bot: Bot, db: Database, settings: Settings) -> 
             export_file = _build_daily_export_path(settings.db_export_path, today)
             try:
                 columns, rows = await db.export_users_table()
-                workbook = Workbook()
-                worksheet = workbook.active
-                worksheet.title = "users"
-                worksheet.append(columns)
-                for row in rows:
-                    worksheet.append(row)
-                workbook.save(export_file)
+                write_xlsx_export(export_file, columns, rows)
 
                 await bot.send_document(
                     settings.admin_chat_id,
