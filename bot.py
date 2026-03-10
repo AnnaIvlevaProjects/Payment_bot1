@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import calendar
-import csv
 import json
 import logging
 import os
@@ -22,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 from dotenv import load_dotenv
+from openpyxl import Workbook
 
 from db import Database
 from keyboards import back_to_main_menu, email_offer_kb, main_menu, month_selector
@@ -313,7 +313,7 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
 def _build_daily_export_path(base_path: str, for_date: date) -> Path:
     export_dir = Path(base_path)
     export_dir.mkdir(parents=True, exist_ok=True)
-    return export_dir / f"users_export_{for_date.isoformat()}.csv"
+    return export_dir / f"users_export_{for_date.isoformat()}.xlsx"
 
 
 def _upload_file_to_yandex_disk(local_file: Path, token: str, remote_path: str) -> None:
@@ -343,10 +343,13 @@ async def daily_db_export_worker(bot: Bot, db: Database, settings: Settings) -> 
             export_file = _build_daily_export_path(settings.db_export_path, today)
             try:
                 columns, rows = await db.export_users_table()
-                with export_file.open("w", encoding="utf-8", newline="") as handle:
-                    writer = csv.writer(handle, delimiter=";")
-                    writer.writerow(columns)
-                    writer.writerows(rows)
+                workbook = Workbook()
+                worksheet = workbook.active
+                worksheet.title = "users"
+                worksheet.append(columns)
+                for row in rows:
+                    worksheet.append(row)
+                workbook.save(export_file)
 
                 await bot.send_document(
                     settings.admin_chat_id,
